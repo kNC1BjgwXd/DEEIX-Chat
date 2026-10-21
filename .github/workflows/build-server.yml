@@ -1,0 +1,385 @@
+name: Build Server
+
+# 自动编译服务端二进制（deeix-chat）并打包成可直接部署的 tar.gz。
+#
+# 与仓库自带的 ci.yml / image.yml / desktop-release.yml 的分工：
+#   - ci.yml              只做 `go build ./...`（编译到临时目录，不产出可分发的二进制）
+#   - image.yml           产出 Docker 镜像
+#   - desktop-release.yml 产出桌面客户端安装包
+# 本工作流补上「裸二进制 + 前端静态资源 + 配置模板」这一条链路。
+#
+# 关键约束（已对源码核实）：
+#   - SQLite 通过 cgo 链接（mattn/go-sqlite3 + sqlite-vec-go-bindings/cgo），
+#     必须 CGO_ENABLED=1，并安装 libsqlite3-dev 提供 sqlite3.h / sqlite3ext.h
+#   - Go 版本锁在 backend/go.mod 的 go 指令上（1.26.8）
+#   - 轻量变体的 build tags 与 apps/desktop/scripts/build-sidecar.mjs、
+#     .github/workflows/ci.yml 保持一致
+
+on:
+  push:
+    branches: [dev, main]
+    tags: ['v*']
+  pull_request:
+    branches: [dev, main]
+  workflow_dispatch:
+    inputs:
+      refresh_catalog_snapshots:
+        description: '刷新内置目录快照（models.dev / OpenRouter 定价）；失败时保留仓库快照，不中断构建'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-server-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 嵌入式版本信息的包路径，见 backend/internal/shared/buildinfo
+  BUILDINFO: github.com/DEEIX-AI/DEEIX-Chat/backend/internal/shared/buildinfo
+  # 轻量变体的 build tags，与官方 CI / 桌面端 sidecar 脚本保持一致
+  SIDECAR_TAGS: nopostgres,noredis,nos3,noswagger,nomsgpack,nootlp
+  PNPM_VERSION: 10.17.0
+  NODE_VERSION: 24
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 1) 编译服务端二进制
+  # ---------------------------------------------------------------------
+  server:
+    name: Server (${{ matrix.arch }} / ${{ matrix.variant }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # full = 全功能（PostgreSQL / Redis / S3 / Swagger / OTLP 全都编入）
+          # lite = 裁剪驱动（只保留 SQLite + 内存缓存 + 本地存储），体积更小
+          - arch: amd64
+            runner: ubuntu-24.04
+            variant: full
+            tags: ''
+          - arch: amd64
+            runner: ubuntu-24.04
+            variant: lite
+            tags: nopostgres,noredis,nos3,noswagger,nomsgpack,nootlp
+          # arm64 用 GitHub 原生 ARM runner（无需 QEMU 模拟；官方 image.yml 同款）。
+          # 注意：原生 ARM runner 目前主要面向公开仓库；私有仓库若不可用，
+          # 把 runner 换成 ubuntu-24.04 并加 QEMU，或直接删掉 arm64 两行。
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            variant: full
+            tags: ''
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            variant: lite
+            tags: nopostgres,noredis,nos3,noswagger,nomsgpack,nootlp
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # cgo 需要 sqlite3.h / sqlite3ext.h（sqlite-vec 的 cgo 绑定会 include 它们）
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsqlite3-dev
+          gcc --version | head -1
+
+      - name: Version consistency
+        working-directory: backend
+        run: node ../scripts/sync-version.mjs --check backend
+
+      # 刷新内置目录快照（models.dev 推理能力目录、OpenRouter 官方定价）。
+      # 必须在 go build 之前，因为快照是 go:embed 进二进制的。
+      # 拉取失败时 -keep-on-error 保留仓库里已提交的快照，构建不受影响。
+      - name: Refresh catalog snapshots
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.refresh_catalog_snapshots }}
+        working-directory: backend
+        run: go run ./cmd/catalog-snapshot -keep-on-error
+
+      - name: Build
+        working-directory: backend
+        env:
+          BUILD_TAGS: ${{ matrix.tags }}
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '[:space:]' < ../VERSION)"
+          COMMIT="$(git rev-parse --short HEAD)"
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          LDFLAGS="-s -w \
+            -X ${BUILDINFO}.Version=${VERSION} \
+            -X ${BUILDINFO}.Commit=${COMMIT} \
+            -X ${BUILDINFO}.BuildTime=${BUILD_TIME}"
+
+          # 用数组拼参数，避免 ${VAR:+...} 的引号/分词歧义
+          TAGS_ARGS=()
+          if [ -n "${BUILD_TAGS}" ]; then
+            TAGS_ARGS=(-tags "${BUILD_TAGS}")
+          fi
+
+          mkdir -p ../dist
+          # CGO_ENABLED=1 是硬性的：mattn/go-sqlite3 的主文件带 //go:build cgo
+          # 约束，关掉 cgo 会直接编译失败。
+          CGO_ENABLED=1 go build -trimpath \
+            "${TAGS_ARGS[@]}" \
+            -ldflags "$LDFLAGS" \
+            -o ../dist/deeix-chat ./cmd/server
+
+          # 把版本信息落到文件名，方便下载时辨认
+          mv ../dist/deeix-chat "../dist/deeix-chat-${VERSION}-linux-${{ matrix.arch }}-${{ matrix.variant }}"
+          ls -lh ../dist/
+
+      - name: Verify binary
+        run: |
+          set -euo pipefail
+          bin="$(ls dist/deeix-chat-* | head -1)"
+          echo "==> $bin"
+
+          # 必须是 ELF（7f 45 4c 46），不能是 PE/COFF。先做这个硬校验，
+          # 后面的 file / ldd 只是辅助信息，缺失时不应让构建失败。
+          magic="$(head -c 4 "$bin" | od -An -tx1 | tr -d ' \n')"
+          if [ "$magic" != "7f454c46" ]; then
+            echo "::error::not an ELF binary (magic=$magic)"
+            exit 1
+          fi
+          echo "ELF magic: OK"
+
+          if command -v file >/dev/null 2>&1; then
+            file "$bin"
+          fi
+          if command -v ldd >/dev/null 2>&1; then
+            ldd "$bin" | head -20
+          fi
+
+      # 真跑一次：用 SQLite 单机档起服务，验证 /healthz 与首次管理员引导
+      - name: Smoke test (SQLite)
+        env:
+          HTTP_PORT: 18080
+          APP_ENV: dev
+        run: |
+          set -euo pipefail
+          bin="$(ls dist/deeix-chat-* | head -1)"
+          smoke=/tmp/deeix-smoke
+          rm -rf "$smoke"
+          mkdir -p "$smoke/storage" "$smoke/out"
+
+          cp deploy/config.sqlite.example.yaml "$smoke/config.yaml"
+          # 示例配置里的路径是容器路径（/app/...），改成临时目录
+          sed -i "s|/app/data/deeix.db|$smoke/deeix.db|" "$smoke/config.yaml"
+          sed -i "s|/app/storage|$smoke/storage|" "$smoke/config.yaml"
+          sed -i "s|/app/frontend/out|$smoke/out|" "$smoke/config.yaml"
+
+          CONFIG_FILE="$smoke/config.yaml" \
+          PUBLIC_API_BASE_URL="http://127.0.0.1:18080" \
+          PUBLIC_WEB_BASE_URL="http://127.0.0.1:18080" \
+            "./$bin" > "$smoke/server.log" 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+
+          ok=0
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/healthz > "$smoke/health.json" 2>/dev/null; then
+              ok=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::server did not become healthy"
+            cat "$smoke/server.log"
+            exit 1
+          fi
+          echo "healthz: $(cat "$smoke/health.json")"
+
+          if grep -q "bootstrap superadmin created" "$smoke/server.log"; then
+            echo "superadmin bootstrap: OK"
+          else
+            echo "::warning::superadmin bootstrap marker not found in logs"
+          fi
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: deeix-server-${{ matrix.arch }}-${{ matrix.variant }}
+          path: dist/deeix-chat-*
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------
+  # 2) 构建前端静态资源（Go 服务端可以一并托管，实现单端口单进程部署）
+  # ---------------------------------------------------------------------
+  web:
+    name: Web (static export)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      # NEXT_PUBLIC_API_BASE_URL 留空 = 同源请求。
+      # 服务端把 frontend/out 挂在自身 origin 上，同源才能免去 CORS。
+      - name: Build
+        env:
+          NEXT_PUBLIC_API_BASE_URL: ''
+        run: pnpm turbo run build --filter=@deeix/web
+
+      - name: Upload static assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: deeix-web
+          path: apps/web/out
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------
+  # 3) 打包：二进制 + 前端静态资源 + 配置模板
+  # ---------------------------------------------------------------------
+  package:
+    name: Package
+    needs: [server, web]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download server binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deeix-server-*
+          merge-multiple: true
+          path: artifacts
+
+      - name: Download web assets
+        uses: actions/download-artifact@v4
+        with:
+          name: deeix-web
+          path: web
+
+      - name: Assemble bundles
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          mkdir -p bundles
+
+          for bin in artifacts/deeix-chat-*; do
+            base="$(basename "$bin")"
+            # base = deeix-chat-<version>-linux-<arch>-<variant>
+            # 版本号可能含 '-'（如 0.4.4-beta.1），所以用贪婪匹配取最后一个 -linux-
+            arch="$(echo "$base" | sed -E 's/.*-linux-([^-]+)-([^-]+)$/\1/')"
+            variant="$(echo "$base" | sed -E 's/.*-linux-([^-]+)-([^-]+)$/\2/')"
+            name="deeix-chat-${VERSION}-linux-${arch}-${variant}"
+
+            root="bundles/${name}"
+            mkdir -p "$root/frontend/out"
+            cp "$bin" "$root/deeix-chat"
+            chmod +x "$root/deeix-chat"
+            cp -r web/. "$root/frontend/out/"
+            cp deploy/config.example.yaml "$root/config.postgres-redis.example.yaml"
+            cp deploy/config.full.example.yaml "$root/config.full.example.yaml"
+            cp deploy/config.sqlite.example.yaml "$root/config.sqlite.example.yaml"
+            cp LICENSE NOTICE "$root/" 2>/dev/null || true
+
+            cat > "$root/README.txt" <<EOF
+          DEEIX Chat ${VERSION} — linux/${arch} (${variant})
+          ================================================
+
+          目录结构
+            deeix-chat                        服务端二进制（ELF，可直接执行）
+            frontend/out/                    前端静态资源（由 Go 服务端托管）
+            config.sqlite.example.yaml       SQLite + 内存缓存（单机，最简）
+            config.full.example.yaml         PostgreSQL + Redis 容器栈
+            config.postgres-redis.example.yaml  外部 PostgreSQL + Redis
+            LICENSE / NOTICE
+
+          快速开始（SQLite 单机）
+            1) cp config.sqlite.example.yaml config.yaml
+            2) 编辑 config.yaml：
+                 - app.env 改为 prod
+                 - server.frontend_dist_dir 指向本目录的 frontend/out（绝对路径）
+                 - database.sqlite.path 与 storage.local.root_dir 改成你的实际路径
+                 - security.jwt_secret 与 security.data_encryption_key 换成随机长字符串
+            3) ./deeix-chat
+            4) 访问 http://<host>:8080 ，用 admin 登录
+               初始密码只在首次启动日志里打印一次，搜索关键字：
+                 bootstrap superadmin created
+
+          注意
+            - APP_ENV=prod 会拒绝弱密钥 / 通配 CORS / 非 HTTPS 的公开 URL 启动
+            - 静态资源必须与二进制同机或同挂载点，否则 frontend_dist_dir 指向不到
+            - 备份时别漏 database.sqlite.path 与 storage.local.root_dir
+
+          EOF
+
+            tar -czf "bundles/${name}.tar.gz" -C bundles "$name"
+            rm -rf "$root"
+            echo "packed bundles/${name}.tar.gz"
+          done
+
+          ls -lh bundles/
+
+      - name: Checksums
+        run: |
+          cd bundles
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundles
+          path: bundles/
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------
+  # 4) 打 tag 时发布 GitHub Release
+  # ---------------------------------------------------------------------
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: bundles
+          path: dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG exists; uploading assets"
+            gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
+          else
+            gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+              --title "$TAG" \
+              --generate-notes
+          fi
